@@ -1,20 +1,11 @@
 """
-Convo Orchestrator (CLI)
+agent_workflow.workflow — core implementation
 
-English-first async assistant built with Semantic Kernel, Azure OpenAI, and Tavily.
-It implements an Orchestrator + Researcher pattern with a predictable JSON decision
-contract, a thread-safe HTML logger, and a tiny per-chat memory.
-
-Key ideas:
-- Keep the orchestration logic simple and explicit (no hidden tool routing).
-- Ask the Orchestrator to produce machine-readable JSON when deciding on research.
-- Perform Tavily calls outside the model (direct plugin functions), then feed
-  results back to the Orchestrator to compose the final answer.
-- Always sanitize external content when logging to HTML and guard file writes
-  with an asyncio lock.
-
-This file is intentionally well-commented for learning and maintenance.
+English-first async assistant built on Semantic Kernel + Azure OpenAI + Tavily.
+It implements an Orchestrator + Researcher pattern, with a JSON-only research decision,
+a thread-safe HTML logger, and a tiny per-chat memory.
 """
+
 import os
 import sys
 import re
@@ -25,20 +16,23 @@ import uuid
 from dataclasses import dataclass, field
 from collections import deque
 from datetime import datetime
-from typing import Annotated, Optional, Dict, Any, List, Tuple
+from typing import Annotated, Optional, Dict, Any, List
 
 from dotenv import load_dotenv
 import aioconsole
 
+# Semantic Kernel & Azure OpenAI connector
 from semantic_kernel import Kernel
 from semantic_kernel.agents import ChatCompletionAgent
 from semantic_kernel.connectors.ai.open_ai import AzureChatCompletion
 from semantic_kernel.functions import kernel_function
+
+# Tavily web search/extract
 from tavily import TavilyClient
 
-# =========================
-# Console UI (Rich)
-# =========================
+# ---------------------------------------------
+# Console UI (Rich with simple fallback)
+# ---------------------------------------------
 try:
     from rich.console import Console
     from rich.panel import Panel
@@ -83,7 +77,7 @@ try:
         console.print(Panel(body, title=title, title_align="left", border_style=border))
 
 except Exception:
-    # Fallback if rich is unavailable
+    # Fallback if `rich` is not installed
     console = None
     console_err = None
 
@@ -108,80 +102,60 @@ except Exception:
     def log_section(title: str, content: str, *, markdown: bool = False, border: str = "section") -> None:
         print(f"\n[{title}]\n{content}\n")
 
-
-# =========================
-# Configuration & Utils
-# =========================
-load_dotenv()
+# ---------------------------------------------
+# Configuration & Utilities
+# ---------------------------------------------
+load_dotenv()  # load .env if present
 
 CURRENT_DATE = datetime.now().strftime("%Y-%m-%d")
 LOG_FILE = os.getenv("LOG_FILE", "interaction_log.html")
-_log_lock = asyncio.Lock()
+_log_lock = asyncio.Lock()  # to serialize log writes
 
-# Tasteful defaults (caps)
+# Memory caps
 MAX_FACTS = 50
 MAX_NOTES = 200
 
-# Routing keywords (fallback, lightweight)
+# Heuristic keywords that likely require web research (English)
 EXTERNAL_KEYWORDS = {
     "today", "now", "yesterday", "news", "release", "version",
     "price", "quote", "rate", "exchange", "stock",
     "law", "decree", "regulation", "hours", "open", "closed",
-    "forecast", "weather", "result", "score", "where to buy",
+    "forecast", "weather", "result", "score", "near me", "where to buy",
     "available", "availability", "download", "changelog", "docs",
     "latest", "current", "recent",
 }
 
-LOCAL_PATTERNS = [
-    r"\b(my\s+name\s+is|i\s+am\s+called|call\s+me)\b",
-    r"\b(my\s+preferenc|preferences)\b",
-    r"\b(conversation\s+summary|recap|what\s+i\s+said)\b",
-    r"\b(memory|remember\s+this|store\s+this)\b",
-]
-
-
-def _require_env(var: str) -> str:
-    val = os.getenv(var)
-    if not val:
-        log_error(f"Missing environment variable: {var}")
-    return val or ""
-
-
 def _all_env_ok(vars_: List[str]) -> bool:
+    """Return True if all required env vars are present; otherwise log and return False."""
     missing = [v for v in vars_ if not os.getenv(v)]
     if missing:
-        log_warning("The following environment variables are missing:")
+        log_warning("Missing environment variables:")
         for v in missing:
             log_error(f" - {v}")
         return False
     return True
 
-
-# =========================
+# ---------------------------------------------
 # Tavily (async wrappers)
-# =========================
+# ---------------------------------------------
 async def tavily_search_async(client: TavilyClient, *, query: str, max_results: int = 3, timeout: float = 12.0) -> Dict[str, Any]:
-    """Runs Tavily.search in a non-blocking way with a timeout."""
-
+    """Run Tavily.search in a non-blocking way with a timeout."""
     def _call():
         return client.search(query=query, max_results=max_results, search_depth="advanced")
-
     return await asyncio.wait_for(asyncio.to_thread(_call), timeout=timeout)
-
 
 async def tavily_extract_async(client: TavilyClient, *, url: str, timeout: float = 15.0) -> Dict[str, Any]:
-    """Runs Tavily.extract in a non-blocking way with a timeout."""
-
+    """Run Tavily.extract in a non-blocking way with a timeout."""
     def _call():
         return client.extract(url)
-
     return await asyncio.wait_for(asyncio.to_thread(_call), timeout=timeout)
 
-
-# =========================
+# ---------------------------------------------
 # Plugins
-# =========================
+# ---------------------------------------------
 class RespondPotato:
+    """Toy plugin to demonstrate SK function exposure."""
+
     @kernel_function(description="Answers potato-related questions.")
     async def respond_to_potato(self, question: Annotated[str, "Potato-related question"]) -> str:
         if "potato" in question.lower():
@@ -191,12 +165,13 @@ class RespondPotato:
             )
         return "This plugin only answers potato-related questions."
 
-
 class SearchOnline:
+    """Web search plugin using Tavily's search API."""
+
     def __init__(self, tavily_client: TavilyClient):
         self._client = tavily_client
 
-    @kernel_function(description="Use Tavily to search the web (use for all questions that are not about potatoes).")
+    @kernel_function(description="Use Tavily to search the web (non-potato questions).")
     async def search_online(self, query: Annotated[str, "Search query"]) -> str:
         log_info("SearchOnline plugin active")
         try:
@@ -213,8 +188,7 @@ class SearchOnline:
                 output = "\n\n".join(bullets)
                 log_section("🔎 SearchOnline Results", output, markdown=True)
                 return output
-
-            log_warning("SearchOnline did not find useful results.")
+            log_warning("SearchOnline found no useful results.")
             return "No results were found for the search."
         except asyncio.TimeoutError:
             log_warning("⏱️ SearchOnline timed out.")
@@ -223,21 +197,21 @@ class SearchOnline:
             log_error(f"SearchOnline error: {e}")
             return "Could not retrieve online information at this time."
 
-
 class ScrapeURL:
+    """Scrape plugin using Tavily's extract API."""
+
     def __init__(self, tavily_client: TavilyClient):
         self._client = tavily_client
 
-    @kernel_function(description="Extracts full content from a URL using Tavily.")
+    @kernel_function(description="Extract full content from a URL using Tavily.")
     async def scrape_url(self, url: Annotated[str, "URL to extract"]) -> str:
         log_info(f"🌐 ScrapeURL plugin active for: {url}")
         try:
             response = await tavily_extract_async(self._client, url=url)
             content = response.get("content") or ""
             if content:
-                log_success(f"Content extracted successfully from {url} (size: {len(content)} chars)")
+                log_success(f"Extracted content from {url} (size: {len(content)} chars)")
                 return content
-
             log_warning(f"No content found at {url}")
             return "No content was found on the provided page."
         except asyncio.TimeoutError:
@@ -247,9 +221,8 @@ class ScrapeURL:
             log_error(f"Error extracting {url}: {e}")
             return f"An error occurred while extracting content: {e}"
 
-
 class LogToHTML:
-    """Thread-safe HTML logger with a single header/footer."""
+    """Thread-safe HTML logger with a single header/footer block."""
 
     _header = """<!DOCTYPE html>
     <html lang="en">
@@ -273,7 +246,7 @@ class LogToHTML:
         self._log_file = log_file
 
     async def _ensure_header(self) -> None:
-        """Ensures the file has a header and an open body tag."""
+        """Ensure the HTML file exists with a header and open <body>."""
         if not os.path.exists(self._log_file) or os.path.getsize(self._log_file) == 0:
             async with _log_lock:
                 if not os.path.exists(self._log_file) or os.path.getsize(self._log_file) == 0:
@@ -283,19 +256,19 @@ class LogToHTML:
         with open(self._log_file, "a", encoding="utf-8") as f:
             f.write(text)
 
-    @kernel_function(description="Logs the interaction to an HTML file.")
+    @kernel_function(description="Log one interaction to the HTML file.")
     async def log_interaction(
         self,
         user_query: Annotated[str, "User question"],
-        initial_response: Annotated[str, "Initial response from orchestrator"],
+        initial_response: Annotated[str, "Initial orchestrator response"],
         researcher_called: Annotated[str, "Whether researcher was called (YES/NO)"],
         researcher_response: Annotated[str, "Researcher response"],
-        final_response: Annotated[str, "Final response from orchestrator"],
+        final_response: Annotated[str, "Final orchestrator response"],
     ) -> str:
         await self._ensure_header()
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Sanitize all fields
+        # Escape/encode any HTML/JS content before writing
         uq = html.escape(user_query, quote=True)
         ir = html.escape(initial_response, quote=True)
         rc = html.escape(researcher_called, quote=True)
@@ -318,7 +291,7 @@ class LogToHTML:
         return "Interaction logged."
 
     def close_file(self) -> None:
-        """Closes the HTML with a footer."""
+        """Close the HTML with a footer tag. Safe to call multiple times."""
         try:
             with open(self._log_file, "ab+") as f:
                 f.seek(0, os.SEEK_END)
@@ -330,41 +303,33 @@ class LogToHTML:
         except Exception as e:
             log_warning(f"Could not close HTML: {e}")
 
-
-# =========================
+# ---------------------------------------------
 # Memory (per-chat)
-# =========================
+# ---------------------------------------------
 @dataclass
 class ChatMemory:
+    """Minimal ephemeral memory container for a single chat session."""
     session_id: str
     facts: Dict[str, str] = field(default_factory=dict)
     notes: deque = field(default_factory=lambda: deque(maxlen=MAX_NOTES))
 
     def to_json(self) -> str:
+        """Return a pretty JSON dump of the memory for logging/export."""
         return json.dumps(
             {"session_id": self.session_id, "facts": self.facts, "notes": list(self.notes)},
             ensure_ascii=False,
             indent=2,
         )
 
-    @classmethod
-    def from_json(cls, s: str) -> "ChatMemory":
-        data = json.loads(s)
-        mem = cls(session_id=data["session_id"])
-        mem.facts = data.get("facts", {})
-        mem.notes = deque(data.get("notes", []), maxlen=MAX_NOTES)
-        return mem
-
     def prune(self) -> None:
+        """Ensure memory caps are respected (avoid unbounded growth)."""
         if len(self.facts) > MAX_FACTS:
             overflow = len(self.facts) - MAX_FACTS
             for k in list(self.facts.keys())[:overflow]:
                 self.facts.pop(k, None)
 
-
 class MemoryPlugin:
-    """Simple memory plugin: get/set/append and export."""
-
+    """Kernel-exposed memory operations: get/set/append/remove."""
     def __init__(self, memory: ChatMemory):
         self._memory = memory
 
@@ -395,40 +360,24 @@ class MemoryPlugin:
         self._memory.facts.pop(key.strip(), None)
         return "OK: removed (if existed)"
 
-
-# =========================
-# Routing & Brief
-# =========================
+# ---------------------------------------------
+# Routing helpers
+# ---------------------------------------------
 def _has_url(text: str) -> bool:
+    """Heuristic: does the text appear to contain a URL?"""
     t = text.lower()
     return "http://" in t or "https://" in t or "www." in t
 
-
-def needs_research_and_why(user_message: str, memory: ChatMemory) -> Tuple[bool, str]:
-    """Very simple fallback router (kept for contingency only)."""
-    t = user_message.lower().strip()
-    if _has_url(t):
-        return True, "url"
-    if re.search(r"\b(my\s+name\s+is|i\s+am\s+called|call\s+me)\b", t) and memory.facts.get("name"):
-        return False, "has_memory:name"
-    for pat in LOCAL_PATTERNS:
-        if re.search(pat, t):
-            return False, f"local:{pat}"
-    for kw in EXTERNAL_KEYWORDS:
-        if kw in t:
-            return True, f"kw:{kw}"
-    return False, "default"
-
-
 def _rewrite_query_for_web(q: str, *, locale_hint="United States", lang_hint="en-US") -> str:
+    """Rewrite user input into a more web-search-ready query with explicit locale/language/context."""
     t = q.strip()
     t = re.sub(r"\b(i|my|mine|me|our|ours)\b", " ", t, flags=re.I)
     t = re.sub(r"[!?]+", " ", t).strip()
     t = re.sub(r"\s{2,}", " ", t)
     return f"{t} — location: {locale_hint}, language: {lang_hint}. Context: {CURRENT_DATE}."
 
-
-def build_research_brief(user_message: str, memory: ChatMemory) -> Dict[str, Any]:
+def build_research_brief(user_message: str, memory_city_hint: Optional[str] = None) -> Dict[str, Any]:
+    """Produce a minimal brief including intent and two related queries."""
     msg = user_message.strip()
     t = msg.lower()
     if any(w in t for w in ["price", "quote", "exchange", "rate", "stock"]):
@@ -442,26 +391,19 @@ def build_research_brief(user_message: str, memory: ChatMemory) -> Dict[str, Any
     else:
         intent = "general_fact"
 
-    # Build two queries: one as-is, one stripped
-    q1 = _rewrite_query_for_web(msg)
-    q2 = _rewrite_query_for_web(re.sub(r"\b(what|which|when|where|why|how)\b", "", t, flags=re.I).strip())
+    q1 = _rewrite_query_for_web(msg, locale_hint=memory_city_hint or "United States")
+    q2 = _rewrite_query_for_web(re.sub(r"\b(what|which|when|where|why|how)\b", "", t, flags=re.I).strip(), locale_hint=memory_city_hint or "United States")
+    return {"intent": intent, "queries": [q1, q2]}
 
-    brief = {
-        "intent": intent,
-        "queries": [q1, q2],
-        "notes": {"locale": "United States", "lang": "en-US", "date": CURRENT_DATE},
-    }
-    return brief
-
-
-# =========================
+# ---------------------------------------------
 # Agents & Kernel
-# =========================
+# ---------------------------------------------
 def build_agents(memory_plugin: Optional[Any] = None) -> Dict[str, Any]:
-    # Env validation
+    """Create kernels, agents, and plugin instances. Minimal + explicit."""
     if not _all_env_ok(["AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_KEY", "AZURE_OPENAI_DEPLOYMENT", "TAVILY_API_KEY"]):
         raise SystemExit(1)
 
+    # Azure chat service
     azure_chat_service = AzureChatCompletion(
         service_id="azure_chat",
         endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
@@ -479,7 +421,7 @@ def build_agents(memory_plugin: Optional[Any] = None) -> Dict[str, Any]:
     logger_kernel = Kernel()
     logger_kernel.add_service(azure_chat_service)
 
-    # Tavily
+    # Tavily client
     tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
     # Plugins
@@ -526,7 +468,6 @@ def build_agents(memory_plugin: Optional[Any] = None) -> Dict[str, Any]:
         plugins=[logger_plugin],
     )
 
-    # Return agents and plugin instances (for direct calls)
     return {
         "researcher_agent": researcher_agent,
         "orchestrator_agent": orchestrator_agent,
@@ -536,12 +477,11 @@ def build_agents(memory_plugin: Optional[Any] = None) -> Dict[str, Any]:
         "scrape_plugin": scrape_plugin,
     }
 
-
-# =========================
-# Interaction helpers
-# =========================
+# ---------------------------------------------
+# Agent interaction helpers
+# ---------------------------------------------
 async def get_response(agent: ChatCompletionAgent, message: str) -> str:
-    """Aggregate the full streamed response from the agent."""
+    """Stream an agent response and return the concatenated text."""
     parts: List[str] = []
     try:
         async for resp in agent.invoke(message):
@@ -551,8 +491,8 @@ async def get_response(agent: ChatCompletionAgent, message: str) -> str:
         return f"[Error generating response: {e}]"
     return "".join(parts).strip()
 
-
 def _is_yes_no(answer: str) -> Optional[bool]:
+    """Parse a (yes|no) answer; return True/False or None if ambiguous."""
     if not answer:
         return None
     m = re.fullmatch(r"\s*(yes|no)\s*", answer.strip().lower())
@@ -560,23 +500,23 @@ def _is_yes_no(answer: str) -> Optional[bool]:
         return None
     return m.group(1) == "yes"
 
-
-def _maybe_store_name(umsg: str, chat_memory: ChatMemory) -> None:
+def _maybe_store_name(umsg: str, chat_memory: "ChatMemory") -> None:
+    """Extract and store a 'my name is X' self-introduction."""
     m = re.search(r"^\s*my\s+name\s+is\s+([A-Za-z' -]{2,})\s*$", umsg, re.I)
     if m:
-        name = m.group(1).strip().title()
-        chat_memory.facts["name"] = name
+        chat_memory.facts["name"] = m.group(1).strip().title()
 
-
-def _maybe_store_location(umsg: str, chat_memory: ChatMemory) -> None:
+def _maybe_store_location(umsg: str, chat_memory: "ChatMemory") -> None:
+    """Extract and store 'I live/am in X' location hints."""
     m = re.search(r"\b(i\s+(live|am)\s+in)\s+([A-Za-z' -]{2,})\b", umsg, re.I)
     if m:
-        city = m.group(3).strip().title()
-        chat_memory.facts["city"] = city
-
+        chat_memory.facts["city"] = m.group(3).strip().title()
 
 async def decide_research(orchestrator_agent: ChatCompletionAgent, memory_context: str, user_message: str) -> Dict[str, Any]:
-    """Ask the orchestrator to decide if web research is needed (machine-readable JSON)."""
+    """
+    Ask the orchestrator agent to decide if web research is needed.
+    Returns a dict matching the JSON schema (README).
+    """
     schema = """{
       "needs_research": true,
       "reason": "short string",
@@ -601,18 +541,15 @@ async def decide_research(orchestrator_agent: ChatCompletionAgent, memory_contex
 
     raw = await get_response(orchestrator_agent, prompt)
 
-    # Extract JSON robustly (remove code fences, etc.)
+    # Robust JSON extraction (strip ``` fences and find first {...})
     text = raw.strip()
-    # Strip ```json fences if present
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.S)
-    # Find the first {...} block if needed
     m = re.search(r"\{.*\}", text, flags=re.S)
     if m:
         text = m.group(0)
     try:
         data = json.loads(text)
     except Exception:
-        # Conservative fallback
         data = {
             "needs_research": False,
             "reason": "fallback-parse",
@@ -625,7 +562,6 @@ async def decide_research(orchestrator_agent: ChatCompletionAgent, memory_contex
         }
     return data
 
-
 async def safe_log(
     logger_agent: ChatCompletionAgent,
     *,
@@ -635,6 +571,7 @@ async def safe_log(
     researcher_text: str,
     final_text: str,
 ) -> None:
+    """Ask the logging agent to persist the turn to HTML via the LogToHTML plugin."""
     log_prompt = (
         "Log this interaction to HTML (use the LogToHTML plugin):\n\n"
         f"User Question: {user_message}\n"
@@ -651,18 +588,13 @@ async def safe_log(
     except Exception as e:
         log_warning(f"Failed to log interaction: {e}")
 
-
-# =========================
-# Export & Reset
-# =========================
 async def export_and_reset(chat_memory: ChatMemory, logger_plugin: LogToHTML) -> None:
-    # 1) Export memory JSON
+    """Export memory to JSON/TXT, close the HTML log, and clear in-memory state."""
     mem_json_path = f"memory_{chat_memory.session_id}.json"
     with open(mem_json_path, "w", encoding="utf-8") as f:
         f.write(chat_memory.to_json())
     log_success(f"🧠 Memory exported to {mem_json_path}")
 
-    # 2) Export memory pretty text (optional)
     mem_txt_path = f"memory_{chat_memory.session_id}.txt"
     lines = ["CHAT MEMORY", f"session_id: {chat_memory.session_id}", ""]
     if chat_memory.facts:
@@ -677,48 +609,42 @@ async def export_and_reset(chat_memory: ChatMemory, logger_plugin: LogToHTML) ->
         f.write("\n".join(lines) + "\n")
     log_success(f"🧾 Memory exported to {mem_txt_path}")
 
-    # 3) Close HTML log neatly
     try:
         logger_plugin.close_file()
         log_note("📁 HTML log closed.")
     except Exception as e:
-        log_warning(f"Could not close HTML log: {e}")
+        log_warning(f"Could not close HTML: {e}")
 
-    # 4) Reset (in-memory)
     chat_memory.facts.clear()
     chat_memory.notes.clear()
 
-
-# =========================
+# ---------------------------------------------
 # Main loop (CLI)
-# =========================
+# ---------------------------------------------
 MAX_RESEARCHER_ATTEMPTS = 3  # Max tries with different queries
 
-
 async def orchestrator_flow() -> None:
-    # Per-chat memory
+    """Main REPL loop. Type your question; type 'exit' to quit."""
     session_id = datetime.now().strftime("%Y%m%d-%H%M%S-") + str(uuid.uuid4())[:8]
     chat_memory = ChatMemory(session_id=session_id)
 
-    # Tasteful defaults (seed)
+    # Seed a few defaults
     chat_memory.facts.setdefault("language", "en-US")
     chat_memory.facts.setdefault("units", "SI")
     chat_memory.facts.setdefault("style", "concise-structured")
 
     memory_plugin = MemoryPlugin(chat_memory)
 
-    # Build agents WITH memory plugin (and exposed plugins)
+    # Build agents & expose search/scrape for direct calls
     agents = build_agents(memory_plugin=memory_plugin)
     researcher_agent: ChatCompletionAgent = agents["researcher_agent"]
     orchestrator_agent: ChatCompletionAgent = agents["orchestrator_agent"]
     logger_agent: ChatCompletionAgent = agents["logger_agent"]
     logger_plugin: LogToHTML = agents["logger_plugin"]
-
-    # Direct-access plugins (bulletproof)
     search_plugin: SearchOnline = agents["search_plugin"]
     scrape_plugin: ScrapeURL = agents["scrape_plugin"]
 
-    log_success(f"🚀 Assistant started (session {session_id}). Type your question (or 'exit' to quit).")
+    log_success(f"🚀 Agent workflow started (session {session_id}). Type your question (or 'exit' to quit).")
 
     while True:
         try:
@@ -733,13 +659,13 @@ async def orchestrator_flow() -> None:
             log_info("👋 Bye!")
             break
 
-        # Capture name and location early
+        # Capture optional name/location facts
         _maybe_store_location(user_message, chat_memory)
         _maybe_store_name(user_message, chat_memory)
 
         log_rule("New Interaction")
 
-        # Memory context injected on every turn
+        # Memory context injected every turn
         memory_context = (
             "Memory context (for this chat):\n"
             f"{chat_memory.to_json()}\n\n"
@@ -747,7 +673,7 @@ async def orchestrator_flow() -> None:
             "call the memory plugin to store them."
         )
 
-        # 0) Orchestrator decision (auto-routing)
+        # 0) Orchestrator decides if research is needed
         decision = await decide_research(orchestrator_agent, memory_context, user_message)
         need_research = bool(decision.get("needs_research"))
         confidence = float(decision.get("confidence_local", 0.5))
@@ -755,31 +681,30 @@ async def orchestrator_flow() -> None:
         geo = (decision.get("geoscope") or chat_memory.facts.get("city") or "United States")
         decision_pretty = json.dumps(decision, ensure_ascii=False, indent=2)
         log_section("🧭 Orchestrator Decision", f"[code]{decision_pretty}[/code]", markdown=False)
-        orchestrator_initial = decision_pretty  # for logging
+        orchestrator_initial = decision_pretty  # for HTML log
 
-        # Optional confirmation if confidence is medium
+        # Optional confirmation if confidence is medium and the model asked for it
         if 0.4 <= confidence <= 0.6 and decision.get("ask_user_confirmation", False):
             try:
                 yn = await aioconsole.ainput("🔎 Should I search the web? (yes/no): ")
             except (EOFError, KeyboardInterrupt):
                 yn = "no"
-            yn_bool = _is_yes_no(yn)
-            if yn_bool is not None:
-                need_research = yn_bool
+            if yn.strip().lower() in {"yes", "no"}:
+                need_research = yn.strip().lower() == "yes"
 
         researcher_called = False
         researcher_text = ""
         final_text = ""
 
         if not need_research:
-            # Local response (no researcher)
+            # Local response (no web access)
             final_text = await get_response(
                 orchestrator_agent,
                 f"{memory_context}\n\nUser:\n{user_message}"
             )
             log_section("✅ Orchestrator (Final Answer)", final_text)
         else:
-            # Build queries with geo/language context
+            # Build queries w/ locale & language hints
             language = chat_memory.facts.get("language", "en-US")
 
             def _rew(q: str) -> str:
@@ -788,26 +713,23 @@ async def orchestrator_flow() -> None:
             if queries_from_llm:
                 queries = [_rew(q) for q in queries_from_llm]
             else:
-                brief = build_research_brief(user_message, chat_memory)
+                brief = build_research_brief(user_message, chat_memory.facts.get("city"))
                 queries = [_rew(q) for q in brief["queries"]]
 
             log_section("🔎 Built Query(ies)", "\n".join(f"- {q}" for q in queries))
 
-            # Direct plugin calls + manual concatenation
+            # Direct calls to plugins + concatenation
             researcher_called = True
             urls_pattern = re.compile(r"https?://[^\s)]+", re.I)
 
             for idx, q in enumerate(queries[:MAX_RESEARCHER_ATTEMPTS], start=1):
                 log_info(f"📡 Calling Researcher (query {idx})...")
 
-                # 1) SearchOnline (always first)
                 rr_search = await search_plugin.search_online(q)
                 researcher_text += f"\n[SearchOnline — Query {idx}]\n{rr_search}\n"
                 log_section("🔬 Researcher — SearchOnline", rr_search)
 
-                # Stop condition: found something useful
                 if rr_search and "No results were found" not in rr_search and "could not retrieve" not in rr_search.lower():
-                    # 2) (Optional) Scrape 1–2 relevant URLs detected in the text
                     urls = urls_pattern.findall(rr_search)
                     filtered_urls = [u for u in urls if len(u) > 20 and not re.search(r"news\.google|/home", u)]
                     for u in filtered_urls[:2]:
@@ -816,7 +738,6 @@ async def orchestrator_flow() -> None:
                         log_section("🔬 Researcher — ScrapeURL", f"URL: {u}\n\n{rr_scrape[:1200]}…")
                     break
 
-            # Final response based on researcher findings
             combined_message = (
                 f"{memory_context}\n\n"
                 f"User question: {user_message}\n\n"
@@ -826,7 +747,7 @@ async def orchestrator_flow() -> None:
             final_text = await get_response(orchestrator_agent, combined_message)
             log_section("✅ Orchestrator (Final Answer)", final_text)
 
-        # 4) Auto memory extraction (silent)
+        # Silent auto memory extraction
         memory_extraction_prompt = (
             "Analyze the conversation above and, if there are persistent facts useful for this chat "
             "(preferences, goals, constraints, stable user data), store them using calls to the memory plugin.\n"
@@ -838,7 +759,7 @@ async def orchestrator_flow() -> None:
         )
         _ = await get_response(orchestrator_agent, memory_extraction_prompt)
 
-        # 5) Log
+        # Log the interaction
         await safe_log(
             logger_agent,
             user_message=user_message,
@@ -848,13 +769,12 @@ async def orchestrator_flow() -> None:
             final_text=final_text,
         )
 
-
-def main():
+def main() -> None:
+    """Entry point: run the async CLI orchestrator."""
+    # Validate env before constructing kernels to provide clearer errors
+    if not _all_env_ok(["AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_KEY", "AZURE_OPENAI_DEPLOYMENT", "TAVILY_API_KEY"]):
+        sys.exit(1)
     try:
         asyncio.run(orchestrator_flow())
     except KeyboardInterrupt:
         log_info("👋 Shutting down...")
-
-
-if __name__ == "__main__":
-    main()
