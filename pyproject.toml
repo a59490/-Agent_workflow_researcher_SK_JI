@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "convo-orchestrator"
+version = "0.1.0"
+description = "Async CLI orchestrator using Semantic Kernel, Azure OpenAI, and Tavily with HTML logging and ephemeral memory."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name="Your Name", email="your@email.com"}]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent"
+]
+dependencies = [
+  "python-dotenv>=1.0",
+  "rich>=13.0",
+  "aioconsole>=0.6",
+  "semantic-kernel>=1.0.0",
+  "tavily-python>=0.3.8",
+  "openai>=1.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.5.0",
+  "black>=24.0",
+  "pre-commit>=3.6",
+]
+
+[project.scripts]
+convobot = "convo_orchestrator.main:main"
