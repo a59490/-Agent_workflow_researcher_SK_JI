@@ -87,7 +87,7 @@ python -m venv .venv
 .venv/Scripts/Activate.ps1
 pip install -r requirements.txt
 # fill in keys .env keys
-python -m agent_workflow
+python -m src.agent_workflow
 ```
 
 - Type your question at the prompt.
