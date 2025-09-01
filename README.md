@@ -1,13 +1,13 @@
 # agent_workflow
 
-A **src-layout** Python CLI that runs an **Orchestrator + Researcher** workflow using **Semantic Kernel**, **Azure OpenAI**, and **Tavily**. It includes a tiny **ephemeral memory**, **thread-safe HTML logging**, and a predictable **JSON decision contract** for routing. English-first. **No Docker**, **no CI** — just the code.
+A **src-layout** Python CLI that runs an **Orchestrator + Researcher** workflow using **Semantic Kernel**, **Azure OpenAI**, and **Tavily**. It includes a tiny **ephemeral memory**, **thread-safe HTML logging**, and a predictable **JSON decision contract** for routing. English-first. **No Docker**, **no CI** .
 
 ---
 
 ## ✨ Features
 
 - **Orchestrator**: decides whether web research is required (strict JSON-only contract).
-- **Researcher**: searches the web with **Tavily** and can scrape 1–2 URLs for details.
+- **Researcher**: searches the web with **Tavily** and can scrape 1 to 2 URLs for details.
 - **Plugins**: Potato (toy), SearchOnline, ScrapeURL, LogToHTML, Memory.
 - **HTML logging**: sanitized entries, one per turn.
 - **Ephemeral memory**: per-session facts/notes (exported on exit).
