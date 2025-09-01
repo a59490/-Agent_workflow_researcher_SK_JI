@@ -83,10 +83,10 @@ cp .env.example .env
 ## 🚀 Run
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+.venv/Scripts/Activate.ps1
 pip install -r requirements.txt
-cp .env.example .env    # fill in keys
-
+# fill in keys .env keys
 python -m agent_workflow
 ```
 
